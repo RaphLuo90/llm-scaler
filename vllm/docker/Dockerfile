@@ -75,7 +75,7 @@ ENV VIRTUAL_ENV=/opt/buildenv \
 # both bash-only (unavailable under the default /bin/sh).
 SHELL ["bash", "-c"]
 
-COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
+COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_igpu_dgpu.patch ./patches/vllm_xpu_kernels.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 
 # --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
@@ -111,6 +111,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --depth 1 -b "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git /src/vllm && \
     cd /src/vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
+    git apply /tmp/vllm_igpu_dgpu.patch && \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind
 

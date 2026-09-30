@@ -36,6 +36,16 @@ FROM ubuntu:22.04 AS rust-build
 
 ARG VLLM_VERSION=v0.26.0
 
+# The intranet blocks direct egress to sh.rustup.rs / crates.io, so rustup and
+# cargo MUST go through the corporate proxy. ARG alone only enables substitution
+# (not the RUN env), so we promote them to ENV; otherwise curl fails with (60).
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    no_proxy=${no_proxy}
+
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_BUILD_JOBS=4
 
@@ -43,6 +53,12 @@ RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential unzip python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
+
+# Trust the Intel corporate proxy (Fortinet TLS interception) so HTTPS to
+# sh.rustup.rs / crates.io etc. verifies. Without this, curl/cargo fail with
+# "unable to get local issuer certificate" behind the intranet proxy.
+COPY docker/intel-ca/*.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
 
 RUN git clone --depth 1 --branch "${VLLM_VERSION}" \
         https://github.com/vllm-project/vllm.git /workspace/vllm
@@ -61,6 +77,11 @@ FROM intel/omix:0.1.0-devel-ubuntu24.04
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
+# Promote to ENV so RUN steps (uv installer, git clone, pip, oneCCL download)
+# tunnel through the corporate proxy instead of a blocked direct egress.
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    no_proxy=${no_proxy}
 ARG VLLM_VERSION=v0.26.0
 # vllm-xpu-kernels pinned base commit (identical to prod build).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
@@ -96,6 +117,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 \
         gdb vim less htop procps
 
+# Trust the Intel corporate proxy CA (Fortinet TLS interception) for all HTTPS
+# in this stage: uv installer, git clone, pip index, oneCCL release download.
+COPY docker/intel-ca/*.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
 # --- isolated venv at /opt/venv (same path prod runtime uses, so the env-var
 #     paths above resolve; OMIX system python is PEP-668 blocked) ---
 RUN python3 -m venv ${VIRTUAL_ENV}
@@ -112,7 +138,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN mkdir -p ${WHEELS}
 
-COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
+COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_igpu_dgpu.patch ./patches/vllm_xpu_kernels.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /llm-scaler/vllm/custom-esimd-kernels-vllm
 
 WORKDIR /llm-scaler/vllm
@@ -164,6 +190,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --depth 1 -b "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git ./vllm && \
     cd ./vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
+    git apply /tmp/vllm_igpu_dgpu.patch && \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind
 

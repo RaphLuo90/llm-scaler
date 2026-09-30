@@ -1,0 +1,1412 @@
+diff --git a/vllm/distributed/device_communicators/oneccl_igpu_communicator.py b/vllm/distributed/device_communicators/oneccl_igpu_communicator.py
+new file mode 100644
+index 0000000000..f7a4a28d0d
+--- /dev/null
++++ b/vllm/distributed/device_communicators/oneccl_igpu_communicator.py
+@@ -0,0 +1,706 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import ctypes
++import os
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++import torch.distributed as dist
++from torch.distributed import ProcessGroup
++
++from .base_device_communicator import DeviceCommunicatorBase
++
++
++ONECCL_SUCCESS = 0
++# onecclDataType_t (include/oneapi/ccl/v2/types.h)
++ONECCL_INT8 = 0
++ONECCL_UINT8 = 1
++ONECCL_INT32 = 2
++ONECCL_INT64 = 4
++ONECCL_FLOAT16 = 6
++ONECCL_FLOAT32 = 7
++ONECCL_FLOAT64 = 8
++ONECCL_BFLOAT16 = 9
++# onecclRedOp_t (include/oneapi/ccl/v2/types.h)
++ONECCL_SUM = 0
++UNIQUE_ID_BYTES = 4096
++
++
++class OneCCLUniqueId(ctypes.Structure):
++    _fields_ = [("data", ctypes.c_char * UNIQUE_ID_BYTES)]
++
++
++class OneCCLError(RuntimeError):
++    def __init__(self, fn: str, code: int):
++        super().__init__(f"{fn} failed with onecclResult_t={code}")
++        self.code = code
++
++
++class OneCCL:
++    def __init__(self, lib_path: str):
++        self.lib = ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
++        self._comm = ctypes.c_void_p()
++
++        lib = self.lib
++        lib.onecclGetUniqueId.argtypes = [ctypes.POINTER(OneCCLUniqueId)]
++        lib.onecclGetUniqueId.restype = ctypes.c_int
++        lib.onecclSetDevice.argtypes = [ctypes.c_uint]
++        lib.onecclSetDevice.restype = ctypes.c_int
++        lib.onecclCommInitRank.argtypes = [
++            ctypes.POINTER(ctypes.c_void_p),
++            ctypes.c_size_t,
++            OneCCLUniqueId,
++            ctypes.c_int,
++        ]
++        lib.onecclCommInitRank.restype = ctypes.c_int
++        lib.onecclCommDestroy.argtypes = [ctypes.c_void_p]
++        lib.onecclCommDestroy.restype = ctypes.c_int
++        lib.onecclSend.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++        ]
++        lib.onecclSend.restype = ctypes.c_int
++        lib.onecclRecv.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++        ]
++        lib.onecclRecv.restype = ctypes.c_int
++        lib.onecclMemAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
++        lib.onecclMemAlloc.restype = ctypes.c_int
++        lib.onecclMemFree.argtypes = [ctypes.c_void_p]
++        lib.onecclMemFree.restype = ctypes.c_int
++        # VLLM_XPU_IGPU_TP: TP collectives use the plugin's fused
++        # reduce+broadcast / gather kernels (see plugins/igpu allreduce.cpp,
++        # allgather.cpp) instead of torch.distributed on the mixed dGPU/iGPU.
++        lib.onecclAllReduce.argtypes = [
++            ctypes.c_void_p,  # sendbuff
++            ctypes.c_void_p,  # recvbuff
++            ctypes.c_size_t,  # count
++            ctypes.c_int,  # datatype
++            ctypes.c_int,  # reduction_op
++            ctypes.c_void_p,  # comm
++            ctypes.c_void_p,  # stream
++        ]
++        lib.onecclAllReduce.restype = ctypes.c_int
++        lib.onecclAllGather.argtypes = [
++            ctypes.c_void_p,  # sendbuff
++            ctypes.c_void_p,  # recvbuff
++            ctypes.c_size_t,  # sendcount
++            ctypes.c_int,  # datatype
++            ctypes.c_void_p,  # comm
++            ctypes.c_void_p,  # stream
++        ]
++        lib.onecclAllGather.restype = ctypes.c_int
++        # VLLM_XPU_IGPU_TP: register reused collective buffers so the plugin
++        # runs its fd handshake once (then skips it), restoring small-message
++        # latency. Must be paired symmetrically across ranks.
++        lib.onecclCommRegister.argtypes = [
++            ctypes.c_void_p,  # comm
++            ctypes.c_void_p,  # buff
++            ctypes.c_size_t,  # size
++            ctypes.POINTER(ctypes.c_void_p),  # handle (out)
++        ]
++        lib.onecclCommRegister.restype = ctypes.c_int
++        lib.onecclCommDeregister.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
++        lib.onecclCommDeregister.restype = ctypes.c_int
++
++    def _check(self, fn: str, code: int) -> None:
++        if code != ONECCL_SUCCESS:
++            raise OneCCLError(fn, code)
++
++    def get_unique_id(self) -> OneCCLUniqueId:
++        uid = OneCCLUniqueId()
++        self._check("onecclGetUniqueId", self.lib.onecclGetUniqueId(ctypes.byref(uid)))
++        return uid
++
++    def set_device(self, index: int) -> None:
++        self._check("onecclSetDevice", self.lib.onecclSetDevice(index))
++
++    def comm_init_rank(self, nranks: int, uid: OneCCLUniqueId, rank: int) -> None:
++        self._check(
++            "onecclCommInitRank",
++            self.lib.onecclCommInitRank(
++                ctypes.byref(self._comm), nranks, uid, rank
++            ),
++        )
++
++    def send(self, ptr: int, count: int, dtype: int, peer: int, stream: int) -> None:
++        self._check(
++            "onecclSend",
++            self.lib.onecclSend(
++                ctypes.c_void_p(ptr),
++                count,
++                dtype,
++                peer,
++                self._comm,
++                ctypes.c_void_p(stream),
++            ),
++        )
++
++    def recv(self, ptr: int, count: int, dtype: int, peer: int, stream: int) -> None:
++        self._check(
++            "onecclRecv",
++            self.lib.onecclRecv(
++                ctypes.c_void_p(ptr),
++                count,
++                dtype,
++                peer,
++                self._comm,
++                ctypes.c_void_p(stream),
++            ),
++        )
++
++    def all_reduce(
++        self, sendptr: int, recvptr: int, count: int, dtype: int, op: int, stream: int
++    ) -> None:
++        self._check(
++            "onecclAllReduce",
++            self.lib.onecclAllReduce(
++                ctypes.c_void_p(sendptr),
++                ctypes.c_void_p(recvptr),
++                count,
++                dtype,
++                op,
++                self._comm,
++                ctypes.c_void_p(stream),
++            ),
++        )
++
++    def all_gather(
++        self, sendptr: int, recvptr: int, sendcount: int, dtype: int, stream: int
++    ) -> None:
++        self._check(
++            "onecclAllGather",
++            self.lib.onecclAllGather(
++                ctypes.c_void_p(sendptr),
++                ctypes.c_void_p(recvptr),
++                sendcount,
++                dtype,
++                self._comm,
++                ctypes.c_void_p(stream),
++            ),
++        )
++
++    def comm_register(self, ptr: int, size: int) -> int:
++        handle = ctypes.c_void_p()
++        self._check(
++            "onecclCommRegister",
++            self.lib.onecclCommRegister(
++                self._comm, ctypes.c_void_p(ptr), size, ctypes.byref(handle)
++            ),
++        )
++        return handle.value if handle.value is not None else ptr
++
++    def comm_deregister(self, handle: int) -> None:
++        self._check(
++            "onecclCommDeregister",
++            self.lib.onecclCommDeregister(self._comm, ctypes.c_void_p(handle)),
++        )
++
++    def mem_alloc(self, size: int) -> int:
++        ptr = ctypes.c_void_p()
++        self._check("onecclMemAlloc", self.lib.onecclMemAlloc(ctypes.byref(ptr), size))
++        assert ptr.value is not None
++        return ptr.value
++
++    def mem_free(self, ptr: int) -> None:
++        if ptr:
++            self._check("onecclMemFree", self.lib.onecclMemFree(ctypes.c_void_p(ptr)))
++
++    def destroy(self) -> None:
++        if self._comm:
++            self._check("onecclCommDestroy", self.lib.onecclCommDestroy(self._comm))
++            self._comm = ctypes.c_void_p()
++
++
++@dataclass
++class _PreparedTensor:
++    tensor: torch.Tensor
++    ptr: int
++    count: int
++    ccl_dtype: int
++    nbytes: int
++    host_ptr: int | None = None
++
++
++@dataclass
++class _CollBuf:
++    """A stable, registered per-role collective buffer.
++
++    ``ptr`` is what the plugin sees; ``nbytes`` is its (grow-only) capacity;
++    ``handle`` is the onecclCommRegister handle. On the dGPU ``keep`` owns the
++    torch device allocation (a uint8 buffer reinterpreted per call); on the
++    iGPU ``keep`` is None and ``ptr`` is plugin USM-host memory.
++    """
++
++    ptr: int
++    nbytes: int
++    handle: int
++    keep: Any = None
++    registered: bool = True
++
++
++class OneCCLIgpuCommunicator(DeviceCommunicatorBase):
++    def __init__(
++        self,
++        cpu_group: ProcessGroup,
++        device: torch.device | None = None,
++        device_group: ProcessGroup | None = None,
++        unique_name: str = "",
++    ):
++        super().__init__(cpu_group, device, device_group, unique_name)
++        if self.world_size != 2:
++            # The igpu plugin topology is fixed at 2 ranks (1 dGPU + 1 iGPU on
++            # the same host); this holds for both PP=2 and TP=2.
++            raise NotImplementedError(
++                "VLLM_XPU_IGPU currently supports exactly 2 ranks "
++                "(1 dGPU + 1 iGPU), i.e. PP=2 or TP=2 only"
++            )
++
++        # VLLM_XPU_IGPU_*: load the oneCCL v2 C API. CCL_PLUGIN selects
++        # libccl_igpu.so; do not use torch.distributed for PP tensors or TP
++        # collectives on the mixed dGPU/iGPU platform.
++        lib_path = os.getenv(
++            "VLLM_XPU_IGPU_LIB", os.getenv("VLLM_XPU_IGPU_PP_LIB", "libccl.so")
++        )
++        self.ccl = OneCCL(lib_path)
++        self.is_igpu_rank = self.rank_in_group == 1
++        self._stream = torch.xpu.current_stream().sycl_queue
++        self._debug = os.getenv("VLLM_XPU_IGPU_DEBUG", "0") == "1" or (
++            os.getenv("VLLM_XPU_IGPU_PP_DEBUG", "0") == "1"
++        )
++        # VLLM_XPU_IGPU_PP_REGISTER: opt-in to routing PP send/recv through the
++        # stable, REGISTERED _coll_buf pool so the plugin does its pt2pt fd
++        # handshake once per buffer and skips it thereafter. Default off keeps
++        # the original per-op path (fresh USM-host alloc / raw tensor ptr) that
++        # re-handshakes every hop. TP always registers; this makes PP match when
++        # enabled.
++        self._pp_register = os.getenv("VLLM_XPU_IGPU_PP_REGISTER", "1") == "1"
++        # VLLM_XPU_IGPU_TP_REGISTER: gate the registered fast path for TP
++        # collectives (default ON). When "1", the _coll_buf pool registers its
++        # buffers with onecclCommRegister so the plugin runs its fd handshake
++        # once per buffer and skips it thereafter (small-message latency). Set
++        # "0" to keep the stable pool but skip registration -- the plugin then
++        # always re-exchanges (the correct-but-slower always-exchange path),
++        # useful for debugging or isolating the fast path.
++        self._tp_register = os.getenv("VLLM_XPU_IGPU_TP_REGISTER", "1") == "1"
++        # VLLM_XPU_IGPU_TP: grow-only pool of stable collective buffers keyed by
++        # role ("ar_send"/"ar_recv"/"ag_send"/"ag_recv"), on BOTH ranks (iGPU:
++        # plugin USM-host; dGPU: torch device memory). A role keeps one buffer
++        # whose pointer changes only when it must grow; when registration is on
++        # (see _tp_register) the buffer is registered with onecclCommRegister so
++        # the plugin runs its fd handshake once and skips it thereafter
++        # (restoring small-message latency). Grown-out buffers are retired --
++        # deregistered (if registered) but kept alive so their address is never
++        # recycled into a stale plugin import -- and freed only at destroy. In
++        # practice profiling hits the max size first, so no role grows after its
++        # first call.
++        self._coll_bufs: dict[str, _CollBuf] = {}
++        self._retired_bufs: list[_CollBuf] = []
++        self._log(
++            "init "
++            f"rank_in_group={self.rank_in_group} global_rank={self.global_rank} "
++            f"device={self.device} is_igpu_rank={self.is_igpu_rank} "
++        )
++        self._init_comm()
++
++    def _log(self, msg: str) -> None:
++        if self._debug:
++            # VLLM_XPU_IGPU_PP: opt-in debug tracing for prototype PP transfers.
++            print(f"[VLLM_XPU_IGPU_PP][rank {self.rank_in_group}] {msg}", flush=True)
++
++    def _init_comm(self) -> None:
++        if self.rank_in_group == 0:
++            uid = self.ccl.get_unique_id()
++            uid_bytes = bytes(uid.data)
++        else:
++            uid_bytes = None
++
++        objects: list[bytes | None] = [uid_bytes]
++        dist.broadcast_object_list(objects, src=self.ranks[0], group=self.cpu_group)
++        raw = objects[0]
++        assert raw is not None
++        uid = OneCCLUniqueId()
++        uid.data = raw.ljust(UNIQUE_ID_BYTES, b"\x00")[:UNIQUE_ID_BYTES]
++
++        # VLLM_XPU_IGPU_PP: default to rank-based oneCCL device selection to
++        # match plugin examples. Allow override for experiments.
++        ccl_device = int(
++            os.getenv("VLLM_XPU_IGPU_PP_CCL_DEVICE", str(self.rank_in_group))
++        )
++        self._log(f"set oneCCL device={ccl_device}")
++        self.ccl.set_device(ccl_device)
++        self.ccl.comm_init_rank(self.world_size, uid, self.rank_in_group)
++        self._log("oneCCL communicator initialized")
++
++    @staticmethod
++    def _dtype_to_ccl(dtype: torch.dtype) -> int:
++        if dtype == torch.float16:
++            return ONECCL_FLOAT16
++        if dtype == torch.float32:
++            return ONECCL_FLOAT32
++        if dtype == torch.bfloat16:
++            return ONECCL_BFLOAT16
++        if dtype == torch.float64:
++            return ONECCL_FLOAT64
++        if dtype == torch.int32:
++            return ONECCL_INT32
++        if dtype == torch.int64:
++            return ONECCL_INT64
++        if dtype == torch.int8:
++            return ONECCL_INT8
++        if dtype == torch.uint8:
++            return ONECCL_UINT8
++        raise NotImplementedError(f"VLLM_XPU_IGPU unsupported dtype: {dtype}")
++
++    @staticmethod
++    def _dtype_name(dtype: torch.dtype) -> str:
++        return str(dtype).removeprefix("torch.")
++
++    @staticmethod
++    def _dtype_from_name(name: str) -> torch.dtype:
++        return getattr(torch, name)
++
++    def _copy_tensor_to_host_ptr(self, tensor: torch.Tensor, ptr: int) -> None:
++        cpu_tensor = tensor.detach().contiguous().cpu()
++        ctypes.memmove(
++            ptr, cpu_tensor.data_ptr(), cpu_tensor.numel() * cpu_tensor.element_size()
++        )
++
++    def _copy_host_ptr_to_tensor(self, ptr: int, tensor: torch.Tensor) -> None:
++        cpu_tensor = torch.empty(tensor.size(), dtype=tensor.dtype, device="cpu")
++        ctypes.memmove(
++            cpu_tensor.data_ptr(), ptr, cpu_tensor.numel() * cpu_tensor.element_size()
++        )
++        tensor.copy_(cpu_tensor.to(device=tensor.device))
++
++    def _release_prepared(self, item: _PreparedTensor) -> None:
++        if item.host_ptr is not None:
++            self.ccl.mem_free(item.ptr)
++
++    def _prepare_send_tensor(self, tensor: torch.Tensor) -> _PreparedTensor:
++        if not tensor.is_xpu:
++            raise NotImplementedError("VLLM_XPU_IGPU_PP only supports XPU tensors")
++        tensor = tensor.contiguous()
++        ccl_dtype = self._dtype_to_ccl(tensor.dtype)
++        count = tensor.numel()
++        nbytes = count * tensor.element_size()
++
++        if self.is_igpu_rank:
++            # VLLM_XPU_IGPU_PP: iGPU plugin send buffers must be plugin-managed
++            # USM host memory, not raw torch XPU tensor memory.
++            host_ptr = self.ccl.mem_alloc(nbytes)
++            self._copy_tensor_to_host_ptr(tensor, host_ptr)
++            return _PreparedTensor(tensor, host_ptr, count, ccl_dtype, nbytes, host_ptr)
++
++        return _PreparedTensor(tensor, tensor.data_ptr(), count, ccl_dtype, nbytes)
++
++    def _prepare_recv_tensor(self, size: tuple[int, ...], dtype: torch.dtype) -> _PreparedTensor:
++        tensor = torch.empty(size, dtype=dtype, device=self.device)
++        ccl_dtype = self._dtype_to_ccl(dtype)
++        count = tensor.numel()
++        nbytes = count * tensor.element_size()
++
++        if self.is_igpu_rank:
++            # VLLM_XPU_IGPU_PP: iGPU plugin recv buffers must be plugin-managed
++            # USM host memory, then copied back into torch XPU tensors.
++            host_ptr = self.ccl.mem_alloc(nbytes)
++            return _PreparedTensor(tensor, host_ptr, count, ccl_dtype, nbytes, host_ptr)
++
++        return _PreparedTensor(tensor, tensor.data_ptr(), count, ccl_dtype, nbytes)
++
++    def _send_packed(self, packed: torch.Tensor, dst: int) -> None:
++        # Registered fast path (VLLM_XPU_IGPU_PP_REGISTER=1): send from a stable,
++        # REGISTERED per-role buffer (the same _coll_buf pool TP uses) so the
++        # plugin runs its pt2pt fd handshake once and skips it on every later hop
++        # (p2p.cpp registered fast path). Both ranks route matching hops through
++        # registered buffers (sender's pp_send, receiver's pp_recv), so the skip
++        # stays symmetric and the paired kvs_sendrecv never desyncs.
++        if self._pp_register:
++            packed = packed.contiguous()
++            ccl_dtype = self._dtype_to_ccl(packed.dtype)
++            count = packed.numel()
++            nbytes = count * packed.element_size()
++            sbuf = self._coll_buf("pp_send", nbytes)
++            self._log(
++                f"send packed count={count} nbytes={nbytes} dst={dst} "
++                f"ptr=0x{sbuf.ptr:x} reg=1"
++            )
++            if self.is_igpu_rank:
++                self._copy_tensor_to_host_ptr(packed, sbuf.ptr)
++            else:
++                self._dev_view(sbuf, count, packed.dtype).copy_(packed.reshape(-1))
++                torch.xpu.synchronize()
++            self.ccl.send(sbuf.ptr, count, ccl_dtype, dst, self._stream)
++            torch.xpu.synchronize()
++            return
++
++        # Default per-op path: fresh USM-host alloc (iGPU) / raw tensor ptr
++        # (dGPU); re-does the handshake every hop.
++        item = self._prepare_send_tensor(packed)
++        try:
++            self._log(
++                f"send packed count={item.count} nbytes={item.nbytes} "
++                f"dst={dst} ptr=0x{item.ptr:x} reg=0"
++            )
++            torch.xpu.synchronize()
++            self.ccl.send(item.ptr, item.count, item.ccl_dtype, dst, self._stream)
++            torch.xpu.synchronize()
++        finally:
++            self._release_prepared(item)
++
++    def _recv_packed(self, out: torch.Tensor, src: int) -> None:
++        # Registered fast path (VLLM_XPU_IGPU_PP_REGISTER=1): mirror of
++        # _send_packed -- receive into the stable, registered pp_recv buffer,
++        # then copy out into the caller's tensor.
++        if self._pp_register:
++            ccl_dtype = self._dtype_to_ccl(out.dtype)
++            count = out.numel()
++            nbytes = count * out.element_size()
++            rbuf = self._coll_buf("pp_recv", nbytes)
++            self._log(
++                f"recv packed count={count} nbytes={nbytes} src={src} "
++                f"ptr=0x{rbuf.ptr:x} reg=1"
++            )
++            self.ccl.recv(rbuf.ptr, count, ccl_dtype, src, self._stream)
++            torch.xpu.synchronize()
++            if self.is_igpu_rank:
++                self._copy_host_ptr_to_tensor(rbuf.ptr, out)
++            else:
++                out.copy_(self._dev_view(rbuf, count, out.dtype).reshape(out.shape))
++            return
++
++        # Default per-op path.
++        item = self._prepare_recv_tensor((out.numel(),), out.dtype)
++        try:
++            self._log(
++                f"recv packed count={item.count} nbytes={item.nbytes} "
++                f"src={src} ptr=0x{item.ptr:x} reg=0"
++            )
++            self.ccl.recv(item.ptr, item.count, item.ccl_dtype, src, self._stream)
++            torch.xpu.synchronize()
++            if self.is_igpu_rank:
++                self._copy_host_ptr_to_tensor(item.ptr, item.tensor)
++            out.copy_(item.tensor)
++        finally:
++            self._release_prepared(item)
++
++    # --- TP collectives (VLLM_XPU_IGPU_TP) ------------------------------------
++    def _coll_buf(self, role: str, nbytes: int, register: bool = True) -> _CollBuf:
++        """Return a stable collective buffer of >= ``nbytes`` bytes.
++
++        Grow-only: the pointer changes only when a larger size is requested, and
++        the previous buffer is deregistered (if it was registered) + retired
++        (kept alive) so its address is never recycled. Because both ranks issue
++        the same role/size sequence in lockstep, they grow (and thus
++        re-register / re-handshake) together. When ``register`` is False the
++        buffer is not registered with the plugin, so the plugin always
++        re-exchanges for it.
++        """
++        cur = self._coll_bufs.get(role)
++        if cur is not None and cur.nbytes >= nbytes:
++            return cur
++        if cur is not None:
++            if cur.registered:
++                self.ccl.comm_deregister(cur.handle)
++                cur.registered = False
++            self._retired_bufs.append(cur)
++        if self.is_igpu_rank:
++            ptr = self.ccl.mem_alloc(nbytes)
++            keep = None
++        else:
++            keep = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
++            ptr = keep.data_ptr()
++        handle = self.ccl.comm_register(ptr, nbytes) if register else 0
++        buf = _CollBuf(
++            ptr=ptr, nbytes=nbytes, handle=handle, keep=keep, registered=register
++        )
++        self._coll_bufs[role] = buf
++        return buf
++
++    def _dev_view(self, buf: _CollBuf, count: int, dtype: torch.dtype) -> torch.Tensor:
++        # Reinterpret the leading bytes of the dGPU uint8 pool buffer as a
++        # 1-D tensor of ``count`` elements of ``dtype`` (data_ptr == buf.ptr).
++        elsize = torch.empty(0, dtype=dtype).element_size()
++        return buf.keep[: count * elsize].view(dtype)
++
++    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
++        if self.world_size == 1:
++            return input_
++        if not input_.is_xpu:
++            raise NotImplementedError("VLLM_XPU_IGPU_TP only supports XPU tensors")
++        input_ = input_.contiguous()
++        ccl_dtype = self._dtype_to_ccl(input_.dtype)
++        count = input_.numel()
++        nbytes = count * input_.element_size()
++        # Fused reduce+broadcast writes both recvbuffs; return a fresh output
++        # rather than reducing in place (the kernel reads peer sendbuff over PCIe
++        # while writing recvbuff, and the pool recv buffer is overwritten by the
++        # next call so it must not be handed to the caller).
++        output = torch.empty_like(input_)
++        sbuf = self._coll_buf("ar_send", nbytes, self._tp_register)
++        rbuf = self._coll_buf("ar_recv", nbytes, self._tp_register)
++        self._log(f"all_reduce count={count} nbytes={nbytes} igpu={self.is_igpu_rank}")
++
++        if self.is_igpu_rank:
++            self._copy_tensor_to_host_ptr(input_, sbuf.ptr)
++            self.ccl.all_reduce(
++                sbuf.ptr, rbuf.ptr, count, ccl_dtype, ONECCL_SUM, self._stream
++            )
++            torch.xpu.synchronize()
++            self._copy_host_ptr_to_tensor(rbuf.ptr, output)
++        else:
++            self._dev_view(sbuf, count, input_.dtype).copy_(input_.reshape(-1))
++            torch.xpu.synchronize()
++            self.ccl.all_reduce(
++                sbuf.ptr, rbuf.ptr, count, ccl_dtype, ONECCL_SUM, self._stream
++            )
++            torch.xpu.synchronize()
++            output.copy_(self._dev_view(rbuf, count, input_.dtype).reshape(output.shape))
++        return output
++
++    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        if self.world_size == 1:
++            return input_
++        if not input_.is_xpu:
++            raise NotImplementedError("VLLM_XPU_IGPU_TP only supports XPU tensors")
++        if dim < 0:
++            dim += input_.dim()
++        input_ = input_.contiguous()
++        input_size = tuple(input_.size())
++        ccl_dtype = self._dtype_to_ccl(input_.dtype)
++        sendcount = input_.numel()
++        nbytes = sendcount * input_.element_size()
++        total = sendcount * self.world_size
++        self._log(f"all_gather sendcount={sendcount} dim={dim} igpu={self.is_igpu_rank}")
++
++        # Gather rank-major into a flat device tensor, then reshape like the base
++        # communicator (concat-style all-gather, torch.compile compatible).
++        gathered = torch.empty(total, dtype=input_.dtype, device=self.device)
++        sbuf = self._coll_buf("ag_send", nbytes, self._tp_register)
++        rbuf = self._coll_buf("ag_recv", nbytes * self.world_size, self._tp_register)
++        if self.is_igpu_rank:
++            self._copy_tensor_to_host_ptr(input_, sbuf.ptr)
++            self.ccl.all_gather(sbuf.ptr, rbuf.ptr, sendcount, ccl_dtype, self._stream)
++            torch.xpu.synchronize()
++            self._copy_host_ptr_to_tensor(rbuf.ptr, gathered)
++        else:
++            self._dev_view(sbuf, sendcount, input_.dtype).copy_(input_.reshape(-1))
++            torch.xpu.synchronize()
++            self.ccl.all_gather(sbuf.ptr, rbuf.ptr, sendcount, ccl_dtype, self._stream)
++            torch.xpu.synchronize()
++            gathered.copy_(self._dev_view(rbuf, total, input_.dtype))
++
++        output = gathered.reshape((self.world_size,) + input_size)
++        output = output.movedim(0, dim)
++        output = output.reshape(
++            input_size[:dim]
++            + (self.world_size * input_size[dim],)
++            + input_size[dim + 1 :]
++        )
++        return output
++
++    def send_tensor_dict(self, tensor_dict: dict[str, torch.Tensor | Any], dst: int) -> None:
++        self._log(f"send_tensor_dict keys={list(tensor_dict.keys())} dst={dst}")
++        metadata: list[tuple[str, Any]] = []
++        tensor_items: list[tuple[str, torch.Tensor]] = []
++        for key, value in tensor_dict.items():
++            if isinstance(value, torch.Tensor):
++                metadata.append((key, ("tensor", tuple(value.size()), self._dtype_name(value.dtype))))
++                tensor_items.append((key, value))
++            else:
++                metadata.append((key, value))
++
++        dist.send_object_list([metadata], dst=self.ranks[dst], group=self.cpu_group)
++        self._log("sent metadata")
++
++        if tensor_items:
++            dtypes = {tensor.dtype for _, tensor in tensor_items}
++            if len(dtypes) != 1:
++                raise NotImplementedError(
++                    "VLLM_XPU_IGPU_PP packed tensor dict requires one dtype"
++                )
++            # VLLM_XPU_IGPU_PP: the iGPU plugin hangs on multiple sequential or
++            # grouped one-way P2P ops in a single PP hop. Pack all tensor values
++            # into one flat tensor so each PP hop performs exactly one send/recv.
++            packed = torch.cat(
++                [tensor.contiguous().reshape(-1) for _, tensor in tensor_items]
++            )
++            self._log(
++                f"send packed tensors keys={[key for key, _ in tensor_items]} "
++                f"count={packed.numel()} dtype={packed.dtype} "
++                f"dst={dst} igpu={self.is_igpu_rank}"
++            )
++            self._send_packed(packed, dst)
++        self._log("send_tensor_dict done")
++
++    def recv_tensor_dict(self, src: int) -> dict[str, torch.Tensor | Any]:
++        self._log(f"recv_tensor_dict src={src}")
++        metadata_list: list[Any] = [None]
++        dist.recv_object_list(metadata_list, src=self.ranks[src], group=self.cpu_group)
++        metadata = metadata_list[0]
++        assert isinstance(metadata, list)
++        self._log(f"received metadata keys={[key for key, _ in metadata]}")
++
++        result: dict[str, torch.Tensor | Any] = {}
++        tensor_specs: list[tuple[str, tuple[int, ...], torch.dtype]] = []
++        for key, value in metadata:
++            if isinstance(value, tuple) and len(value) == 3 and value[0] == "tensor":
++                _, size, dtype_name = value
++                tensor_specs.append((key, tuple(size), self._dtype_from_name(dtype_name)))
++            else:
++                result[key] = value
++
++        if tensor_specs:
++            dtypes = {dtype for _, _, dtype in tensor_specs}
++            if len(dtypes) != 1:
++                raise NotImplementedError(
++                    "VLLM_XPU_IGPU_PP packed tensor dict requires one dtype"
++                )
++            dtype = next(iter(dtypes))
++            total_numel = sum(int(torch.Size(size).numel()) for _, size, _ in tensor_specs)
++            self._log(
++                f"recv packed tensors keys={[key for key, _, _ in tensor_specs]} "
++                f"count={total_numel} dtype={dtype} "
++                f"src={src} igpu={self.is_igpu_rank}"
++            )
++
++            packed = torch.empty(total_numel, dtype=dtype, device=self.device)
++            self._recv_packed(packed, src)
++            offset = 0
++            for key, size, _ in tensor_specs:
++                numel = int(torch.Size(size).numel())
++                tensor = packed.narrow(0, offset, numel).view(size)
++                result[key] = tensor
++                offset += numel
++
++        self._log("recv_tensor_dict done")
++        return result
++
++    def destroy(self) -> None:
++        # Deregister live buffers (retired ones already were) and free the iGPU
++        # USM-host allocations; dGPU torch buffers are freed by GC. Both ranks
++        # tear down the same roles in the same order, so this stays symmetric.
++        for buf in list(self._coll_bufs.values()) + self._retired_bufs:
++            if buf.registered:
++                try:
++                    self.ccl.comm_deregister(buf.handle)
++                except OneCCLError:
++                    pass
++                buf.registered = False
++            if buf.keep is None and buf.ptr:
++                self.ccl.mem_free(buf.ptr)
++        self._coll_bufs.clear()
++        self._retired_bufs.clear()
++        self.ccl.destroy()
++        super().destroy()
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index 23e1b76a15..1a2b19d041 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
+ 
+ import contextlib
+ import gc
++import os
+ import pickle
+ import weakref
+ from collections import namedtuple
+@@ -127,6 +128,21 @@ def _register_group(group: "GroupCoordinator") -> None:
+     _groups[group.unique_name] = weakref.ref(group)
+ 
+ 
++def _should_skip_tp_pp(group_name: str) -> bool:
++    """Whether TP/PP communication should be skipped for perf profiling.
++
++    Controlled by ``VLLM_SKIP_TP_PP``. When enabled, TP collectives and PP
++    tensor transfers on the "tp"/"pp" groups return shape-correct stand-ins
++    instead of exchanging data, so the model runs end-to-end (results are
++    numerically invalid) and the communication share of latency can be
++    measured. The skip lives above ``device_communicator`` dispatch, so it
++    covers both the igpu and non-igpu backends.
++    """
++    return envs.VLLM_SKIP_TP_PP and (
++        group_name.startswith("tp") or group_name.startswith("pp")
++    )
++
++
+ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+     assert group_name in _groups, f"Group {group_name} is not found."
+     group = _groups[group_name]()
+@@ -470,7 +486,14 @@ class GroupCoordinator:
+             )
+             self.device = torch.device(f"cuda:{visible_device_index}")
+         elif current_platform.is_xpu():
+-            self.device = torch.device(f"xpu:{self.device_index}")
++            # VLLM_XPU_IGPU_{PP,TP}: per-rank ZE_AFFINITY_MASK makes each worker
++            # see exactly one XPU, exposed as process-local xpu:0.
++            igpu = (
++                os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++                or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++            )
++            device_index = 0 if igpu else self.device_index
++            self.device = torch.device(f"xpu:{device_index}")
+         elif current_platform.is_out_of_tree():
+             self.device = torch.device(
+                 f"{current_platform.device_name}:{self.device_index}"
+@@ -511,6 +534,13 @@ class GroupCoordinator:
+             and self.device_communicator
+             and getattr(self.device_communicator, "supports_tensor_dict", False)
+         )
++        self.use_xpu_igpu_pp_send_recv = (
++            # VLLM_XPU_IGPU_PP: route only PP tensor dictionaries through the
++            # oneCCL iGPU plugin communicator; TP/DP collectives stay unchanged.
++            current_platform.is_xpu()
++            and os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++            and self.unique_name.startswith("pp")
++        )
+ 
+     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
+         """Create a new device-side ProcessGroup with the same per-rank membership
+@@ -658,6 +688,12 @@ class GroupCoordinator:
+         if self.world_size == 1:
+             return input_
+ 
++        if _should_skip_tp_pp(self.unique_name):
++            # Skip the actual all-reduce; the summed result has the same shape
++            # as the input, so returning the input unchanged keeps the model
++            # running for communication-overhead profiling.
++            return input_
++
+         use_custom_op = self.use_custom_op_call and not (
+             self.bypass_custom_all_reduce_in_eager
+             and not torch.compiler.is_compiling()
+@@ -682,6 +718,11 @@ class GroupCoordinator:
+             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+         )
+ 
++        if _should_skip_tp_pp(self.unique_name):
++            # Skip the actual all-gather; replicate this rank's input across the
++            # group so the output shape matches (concat of world_size inputs).
++            return torch.cat([input_] * world_size, dim=dim)
++
+         if self.use_custom_op_call:
+             return torch.ops.vllm.all_gather(
+                 input_, dim, world_size, group_name=self.unique_name
+@@ -700,6 +741,18 @@ class GroupCoordinator:
+         dim: int = 0,
+         sizes: list[int] | None = None,
+     ):
++        if _should_skip_tp_pp(self.unique_name) and isinstance(input_, torch.Tensor):
++            # Skip the actual all-gather; return a shape-correct zero tensor
++            # whose gathered dim length is sum(sizes) (or world_size * local
++            # length when sizes is not given). The list-input form is left on
++            # the real path (rare, not on the hot TP path).
++            d = dim if dim >= 0 else dim + input_.dim()
++            out_shape = list(input_.shape)
++            out_shape[d] = (
++                sum(sizes) if sizes is not None else input_.shape[d] * self.world_size
++            )
++            return torch.zeros(out_shape, dtype=input_.dtype, device=input_.device)
++
+         if self.device_communicator is None:
+             raise ValueError("No device communicator found")
+         return self.device_communicator.all_gatherv(input_, dim, sizes)
+@@ -713,6 +766,15 @@ class GroupCoordinator:
+             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+         )
+ 
++        if _should_skip_tp_pp(self.unique_name):
++            # Skip the actual reduce-scatter; return this rank's contiguous
++            # shard so the output shape matches.
++            d = dim if dim >= 0 else dim + input_.dim()
++            input_tensor = input_.movedim(d, 0).contiguous()
++            assert input_tensor.shape[0] % world_size == 0
++            shard = input_tensor.chunk(world_size, dim=0)[self.rank_in_group]
++            return shard.movedim(0, d).contiguous()
++
+         if self.use_custom_op_call:
+             return torch.ops.vllm.reduce_scatter(
+                 input_, dim, world_size, group_name=self.unique_name
+@@ -723,6 +785,20 @@ class GroupCoordinator:
+     def reduce_scatterv(
+         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+     ) -> torch.Tensor:
++        if _should_skip_tp_pp(self.unique_name):
++            # Skip the actual reduce-scatter; return this rank's shard (honoring
++            # variable `sizes` when provided) so the output shape matches.
++            d = dim if dim >= 0 else dim + input_.dim()
++            input_tensor = input_.movedim(d, 0).contiguous()
++            if sizes is not None:
++                assert len(sizes) == self.world_size
++                assert input_tensor.shape[0] == sum(sizes)
++                shard = input_tensor.split(sizes, dim=0)[self.rank_in_group]
++            else:
++                assert input_tensor.shape[0] % self.world_size == 0
++                shard = input_tensor.chunk(self.world_size, dim=0)[self.rank_in_group]
++            return shard.movedim(0, d).contiguous()
++
+         if self.device_communicator is None:
+             raise ValueError("No device communicator found")
+         return self.device_communicator.reduce_scatterv(input_, dim, sizes)
+@@ -1015,6 +1091,16 @@ class GroupCoordinator:
+             dst = (self.rank_in_group + 1) % self.world_size
+         assert dst < self.world_size, f"Invalid dst rank ({dst})"
+ 
++        if _should_skip_tp_pp(self.unique_name):
++            # Skip the heavy per-tensor sends; still exchange the cheap metadata
++            # (shapes/dtypes) so the receiver can allocate matching tensors.
++            assert isinstance(tensor_dict, dict), (
++                f"Expecting a dictionary, got {type(tensor_dict)}"
++            )
++            metadata_list, _ = _split_tensor_dict(tensor_dict)
++            self.send_object(metadata_list, dst=dst)
++            return None
++
+         if self.use_cpu_custom_send_recv:
+             if self.device_communicator is None:
+                 raise ValueError("No device communicator found")
+@@ -1024,6 +1110,19 @@ class GroupCoordinator:
+             )
+             return []
+ 
++        if self.use_xpu_igpu_pp_send_recv:
++            if all_gather_group is not None and all_gather_group.world_size != 1:
++                raise NotImplementedError(
++                    "VLLM_XPU_IGPU_PP does not support send-allgather yet"
++                )
++            if self.device_communicator is None:
++                raise ValueError("No device communicator found")
++            # oneCCL iGPU plugin path is synchronous, so there are no handles.
++            self.device_communicator.send_tensor_dict(  # type: ignore
++                tensor_dict, dst
++            )
++            return []
++
+         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+         all_gather_rank = (
+             0 if all_gather_group is None else all_gather_group.rank_in_group
+@@ -1113,6 +1212,21 @@ class GroupCoordinator:
+             src = (self.rank_in_group - 1) % self.world_size
+         assert src < self.world_size, f"Invalid src rank ({src})"
+ 
++        if _should_skip_tp_pp(self.unique_name):
++            # Skip the heavy per-tensor recvs; read the metadata and materialize
++            # zero tensors with matching shape/dtype/device so the pipeline stays
++            # shape-consistent and runs to completion.
++            recv_metadata_list = self.recv_object(src=src)
++            tensor_dict: dict[str, Any] = {}
++            for key, value in recv_metadata_list:
++                if isinstance(value, TensorMetadata):
++                    tensor_dict[key] = torch.zeros(
++                        value.size, dtype=value.dtype, device=value.device
++                    )
++                else:
++                    tensor_dict[key] = value
++            return tensor_dict
++
+         if self.use_cpu_custom_send_recv:
+             if self.device_communicator is None:
+                 raise ValueError("No device communicator found")
+@@ -1122,6 +1236,19 @@ class GroupCoordinator:
+             )
+             return sync_tensor_dict, [], []
+ 
++        if self.use_xpu_igpu_pp_send_recv:
++            if all_gather_group is not None and all_gather_group.world_size != 1:
++                raise NotImplementedError(
++                    "VLLM_XPU_IGPU_PP does not support send-allgather yet"
++                )
++            if self.device_communicator is None:
++                raise ValueError("No device communicator found")
++            # oneCCL iGPU plugin path is synchronous, so there are no handles.
++            igpu_tensor_dict = self.device_communicator.recv_tensor_dict(  # type: ignore
++                src
++            )
++            return igpu_tensor_dict, [], []
++
+         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+         all_gather_rank = (
+             0 if all_gather_group is None else all_gather_group.rank_in_group
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 698963fd97..b55935a17c 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -120,6 +120,7 @@ if TYPE_CHECKING:
+     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
+     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
+     VLLM_SKIP_P2P_CHECK: bool = False
++    VLLM_SKIP_TP_PP: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+     VLLM_DISABLE_PYNCCL: bool = False
+@@ -1159,6 +1160,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # so that vLLM can verify if p2p is actually working.
+     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
+     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
++    # Unified switch to skip TP collectives and PP tensor send/recv for
++    # communication-overhead profiling. When "1", TP collectives (all_reduce,
++    # all_gather(v), reduce_scatter(v)) and PP tensor transfers on the "tp"/"pp"
++    # groups return shape-correct stand-ins instead of exchanging data. PP still
++    # exchanges the cheap metadata and materializes zero-valued tensors with
++    # matching shapes/dtypes at the receiver, so the model runs end-to-end
++    # (results are numerically invalid). The skip lives above the device
++    # communicator dispatch, so it covers both the igpu and non-igpu backends.
++    "VLLM_SKIP_TP_PP": lambda: os.getenv("VLLM_SKIP_TP_PP", "0") == "1",
+     # List of quantization kernels that should be disabled, used for testing
+     # and performance comparisons. Currently only affects MPLinearKernel
+     # selection
+diff --git a/vllm/platforms/__init__.py b/vllm/platforms/__init__.py
+index ac536aff00..ea76a68eed 100644
+--- a/vllm/platforms/__init__.py
++++ b/vllm/platforms/__init__.py
+@@ -134,7 +134,20 @@ def xpu_platform_plugin() -> str | None:
+     try:
+         import torch
+ 
+-        if torch.distributed.is_xccl_available():
++        if (
++            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++        ):
++            # VLLM_XPU_IGPU_{PP,TP} use a custom oneCCL C API communicator for
++            # PP tensors / TP collectives. Avoid ordinary XCCL device groups
++            # across dGPU/iGPU, which can fail during Level Zero IPC setup on
++            # mixed devices.
++            dist_backend = "gloo"
++            from vllm.platforms.xpu import XPUPlatform
++
++            XPUPlatform.dist_backend = dist_backend
++            logger.debug("Confirmed %s backend is available.", XPUPlatform.dist_backend)
++        elif torch.distributed.is_xccl_available():
+             dist_backend = "xccl"
+             from vllm.platforms.xpu import XPUPlatform
+ 
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index f5478dad3c..a92ad6a6b9 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -104,6 +104,86 @@ def get_mem_info_wrapper(
+ torch.accelerator.get_memory_info = get_mem_info_wrapper
+ 
+ 
++# Whether each visible XPU device is an integrated (UMA) GPU that shares
++# system DDR with the CPU. Queried once via the Level-Zero
++# ZE_DEVICE_PROPERTY_FLAG_INTEGRATED bit (hardware truth, independent of memory
++# size). None means the probe could not run. Respects ZE_AFFINITY_MASK: a
++# masked worker sees only its own device.
++_xpu_integrated_flags: list[bool] | None = None
++_xpu_integrated_queried: bool = False
++
++
++def _query_ze_integrated_flags() -> list[bool]:
++    """Return the integrated flag for each visible XPU, in enumeration order."""
++    import ctypes
++    from ctypes import byref, c_int, c_uint32, c_uint64, c_void_p
++
++    ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES = 0x1
++    ZE_DEVICE_PROPERTY_FLAG_INTEGRATED = 0x1
++
++    class _uuid(ctypes.Structure):
++        _fields_ = [("id", ctypes.c_ubyte * 16)]
++
++    class _props(ctypes.Structure):
++        _fields_ = [
++            ("stype", c_int),
++            ("pNext", c_void_p),
++            ("type", c_int),
++            ("vendorId", c_uint32),
++            ("deviceId", c_uint32),
++            ("flags", c_uint32),
++            ("subdeviceId", c_uint32),
++            ("coreClockRate", c_uint32),
++            ("maxMemAllocSize", c_uint64),
++            ("maxHardwareContexts", c_uint32),
++            ("maxCommandQueuePriority", c_uint32),
++            ("numThreadsPerEU", c_uint32),
++            ("physicalEUSimdWidth", c_uint32),
++            ("numEUsPerSubslice", c_uint32),
++            ("numSubslicesPerSlice", c_uint32),
++            ("numSlices", c_uint32),
++            ("timerResolution", c_uint64),
++            ("timestampValidBits", c_uint32),
++            ("kernelTimestampValidBits", c_uint32),
++            ("uuid", _uuid),
++            ("name", ctypes.c_char * 256),
++        ]
++
++    ze = ctypes.CDLL("libze_loader.so.1")
++    if ze.zeInit(0) != 0:
++        raise RuntimeError("zeInit failed")
++    drv_count = c_uint32(0)
++    ze.zeDriverGet(byref(drv_count), None)
++    drivers = (c_void_p * drv_count.value)()
++    ze.zeDriverGet(byref(drv_count), drivers)
++
++    flags: list[bool] = []
++    for drv in drivers:
++        dev_count = c_uint32(0)
++        ze.zeDeviceGet(c_void_p(drv), byref(dev_count), None)
++        devs = (c_void_p * dev_count.value)()
++        ze.zeDeviceGet(c_void_p(drv), byref(dev_count), devs)
++        for dev in devs:
++            p = _props()
++            p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
++            if ze.zeDeviceGetProperties(c_void_p(dev), byref(p)) != 0:
++                raise RuntimeError("zeDeviceGetProperties failed")
++            flags.append(bool(p.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED))
++    return flags
++
++
++def get_xpu_integrated_flags() -> list[bool] | None:
++    global _xpu_integrated_flags, _xpu_integrated_queried
++    if not _xpu_integrated_queried:
++        _xpu_integrated_queried = True
++        try:
++            _xpu_integrated_flags = _query_ze_integrated_flags()
++        except Exception as e:
++            logger.warning("Level-Zero integrated-GPU probe failed: %s", e)
++            _xpu_integrated_flags = None
++    return _xpu_integrated_flags
++
++
+ class XPUPlatform(Platform):
+     _enum = PlatformEnum.XPU
+     device_name: str = "xpu"
+@@ -254,6 +334,25 @@ class XPUPlatform(Platform):
+         device_props = torch.xpu.get_device_properties(device_id)
+         return device_props.total_memory
+ 
++    @classmethod
++    def is_integrated_gpu(cls, device_id: int = 0) -> bool:
++        """Whether the XPU is an integrated (UMA) GPU sharing host DDR.
++
++        Uses the Level-Zero ZE_DEVICE_PROPERTY_FLAG_INTEGRATED bit (hardware
++        truth, independent of memory size). Falls back to a UMA heuristic
++        (device memory pool ~= host RAM) if the probe is unavailable.
++        """
++        flags = get_xpu_integrated_flags()
++        if flags is not None and 0 <= device_id < len(flags):
++            return flags[device_id]
++        try:
++            import psutil
++
++            dev_total = torch.xpu.get_device_properties(device_id).total_memory
++            return dev_total >= 0.8 * psutil.virtual_memory().total
++        except Exception:
++            return False
++
+     @classmethod
+     def inference_mode(cls):
+         return torch.no_grad()
+@@ -425,6 +524,14 @@ class XPUPlatform(Platform):
+ 
+     @classmethod
+     def get_device_communicator_cls(cls) -> str:
++        if (
++            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++        ):
++            # VLLM_XPU_IGPU_{PP,TP}: PP activation tensors and TP collectives use
++            # the oneCCL v2 C API and libccl_igpu.so instead of
++            # torch.distributed send/recv / all_reduce.
++            return "vllm.distributed.device_communicators.oneccl_igpu_communicator.OneCCLIgpuCommunicator"  # noqa
+         if not torch.distributed.is_xccl_available():
+             # Supports xccl with PyTorch versions >= 2.8.0.dev for XPU platform
+             logger.warning(
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 7633ca89cd..003a2ebdce 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -677,6 +677,35 @@ class WorkerProc:
+         if inherited_fds is not None:
+             inherited_fds = inherited_fds.copy()
+             inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
++
++        process_env: dict[str, str] | None = None
++        if (
++            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++        ):
++            # VLLM_XPU_IGPU_MASKS (fallback VLLM_XPU_IGPU_PP_MASKS): ZE_AFFINITY
++            # per local rank; default maps rank 0 -> dGPU, rank 1 -> iGPU.
++            masks = os.getenv(
++                "VLLM_XPU_IGPU_MASKS",
++                os.getenv("VLLM_XPU_IGPU_PP_MASKS", "0,1"),
++            ).split(",")
++            if local_rank >= len(masks):
++                raise RuntimeError(
++                    "VLLM_XPU_IGPU_MASKS does not cover "
++                    f"local_rank={local_rank}: {masks}"
++                )
++            # VLLM_XPU_IGPU_{PP,TP}: set per-worker XPU affinity before torch.xpu
++            # initializes. The parent temporarily applies this env for spawn,
++            # and worker_main applies it again before WorkerProc construction.
++            process_env = {
++                "ZE_AFFINITY_MASK": masks[local_rank].strip(),
++                "CCL_LOCAL_RANK": str(local_rank),
++                "CCL_LOCAL_SIZE": str(vllm_config.parallel_config.world_size),
++                "CCL_WORLD_SIZE": str(vllm_config.parallel_config.world_size),
++                "CCL_PROCESS_LAUNCHER": os.getenv("CCL_PROCESS_LAUNCHER", "none"),
++                "CCL_ATL_TRANSPORT": os.getenv("CCL_ATL_TRANSPORT", "ofi"),
++            }
++
+         process_kwargs = {
+             "vllm_config": vllm_config,
+             "local_rank": local_rank,
+@@ -689,6 +718,7 @@ class WorkerProc:
+             "is_driver_worker": is_driver_worker,
+             # Have the worker close parent end of this worker's pipes too
+             "inherited_fds": inherited_fds if inherited_fds is not None else [],
++            "process_env": process_env,
+         }
+         # Run EngineCore busy loop in background process.
+         proc = context.Process(
+@@ -698,11 +728,22 @@ class WorkerProc:
+             daemon=True,
+         )
+ 
+-        # Apply NUMA binding if configured
+-        with numa_utils.configure_subprocess(
+-            vllm_config, local_rank, process_kind="worker"
+-        ):
+-            proc.start()
++        old_env: dict[str, str | None] = {}
++        if process_env is not None:
++            old_env = {key: os.environ.get(key) for key in process_env}
++            os.environ.update(process_env)
++        try:
++            # Apply NUMA binding if configured
++            with numa_utils.configure_subprocess(
++                vllm_config, local_rank, process_kind="worker"
++            ):
++                proc.start()
++        finally:
++            for key, value in old_env.items():
++                if value is None:
++                    os.environ.pop(key, None)
++                else:
++                    os.environ[key] = value
+ 
+         # Close child ends of pipes here in the parent
+         ready_writer.close()
+@@ -811,6 +852,12 @@ class WorkerProc:
+         """Worker initialization and execution loops.
+         This runs a background process"""
+ 
++        process_env = kwargs.pop("process_env", None)
++        if process_env is not None:
++            # VLLM_XPU_IGPU_PP: re-apply per-worker env in the child before
++            # WorkerProc initializes torch.xpu and distributed state.
++            os.environ.update(process_env)
++
+         # Signal handler used for graceful termination.
+         # SystemExit exception is only raised once to allow this and worker
+         # processes to terminate without error
+diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
+index 091406a22b..d27a8fe9c1 100644
+--- a/vllm/v1/worker/xpu_worker.py
++++ b/vllm/v1/worker/xpu_worker.py
+@@ -43,8 +43,13 @@ class XPUWorker(Worker):
+         # In DP mode, XPU workers see all visible devices.
+         # Offset local_rank by the local DP shard.
+         parallel_config = self.parallel_config
++        _igpu_mode = (
++            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++        )
+         if (
+-            parallel_config.distributed_executor_backend
++            not _igpu_mode
++            and parallel_config.distributed_executor_backend
+             not in ("ray", "external_launcher")
+             and parallel_config.data_parallel_backend != "ray"
+             and parallel_config.nnodes_within_dp == 1
+@@ -74,12 +79,19 @@ class XPUWorker(Worker):
+             and device.type == "xpu"
+             and current_platform.is_xpu()
+         ):
+-            self.device = torch.device(f"xpu:{self.local_rank}")
++            # VLLM_XPU_IGPU_{PP,TP}: each worker is masked to one physical XPU,
++            # so both ranks must use the process-local xpu:0 device.
++            igpu = (
++                os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++                or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++            )
++            self.device_index = 0 if igpu else self.local_rank
++            self.device = torch.device(f"xpu:{self.device_index}")
+             torch.accelerator.set_device_index(self.device)
+             current_platform.check_if_supports_dtype(self.model_config.dtype)
+             torch.accelerator.empty_cache()
+             self.init_gpu_memory = torch.xpu.get_device_properties(
+-                self.local_rank
++                self.device_index
+             ).total_memory
+         else:
+             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
+@@ -101,7 +113,11 @@ class XPUWorker(Worker):
+         )
+ 
+         # global all_reduce needed for overall oneccl warm up
+-        if torch.distributed.is_xccl_available():
++        igpu_mode = (
++            os.getenv("VLLM_XPU_IGPU_PP", "0") == "1"
++            or os.getenv("VLLM_XPU_IGPU_TP", "0") == "1"
++        )
++        if not igpu_mode and torch.distributed.is_xccl_available():
+             torch.distributed.all_reduce(torch.zeros(1).xpu())
+ 
+         if self.use_v2_model_runner:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b587e3043d..a0385157b6 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4845,9 +4845,20 @@ class GPUModelRunner(
+         # Skip for chunked prefill: sampled tokens are dummy
+         # and will be discarded, no need to broadcast.
+         if not self._is_all_reqs_chunked_prefill():
+-            torch.distributed.broadcast(
+-                sampled_token_ids, src=pp.rank, group=pp.device_group
+-            )
++            # A CPU-only PP backend (gloo, used by the heterogeneous iGPU+dGPU
++            # config) cannot broadcast device tensors; bridge through CPU.
++            # Homogeneous multi-GPU (nccl / xccl-oneCCL) broadcasts on-device.
++            if (
++                sampled_token_ids.device.type != "cpu"
++                and torch.distributed.get_backend(pp.device_group) == "gloo"
++            ):
++                torch.distributed.broadcast(
++                    sampled_token_ids.cpu(), src=pp.rank, group=pp.device_group
++                )
++            else:
++                torch.distributed.broadcast(
++                    sampled_token_ids, src=pp.rank, group=pp.device_group
++                )
+ 
+     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
+         """Receive sampled token ids broadcast from last PP stage"""
+@@ -4855,10 +4866,25 @@ class GPUModelRunner(
+         assert not pp.is_last_rank
+         num_reqs = self.input_batch.num_reqs
+         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+         # skip for chunked prefill.
+-        if not self._is_all_reqs_chunked_prefill():
+-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
++        # A CPU-only PP backend (gloo) cannot receive into a device tensor;
++        # receive on CPU then move to the device. nccl/xccl receive on-device.
++        if (
++            self.device.type != "cpu"
++            and torch.distributed.get_backend(pp.device_group) == "gloo"
++        ):
++            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device="cpu")
++            if not self._is_all_reqs_chunked_prefill():
++                torch.distributed.broadcast(
++                    recv, src=pp.last_rank, group=pp.device_group
++                )
++            recv = recv.to(self.device)
++        else:
++            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
++            if not self._is_all_reqs_chunked_prefill():
++                torch.distributed.broadcast(
++                    recv, src=pp.last_rank, group=pp.device_group
++                )
+         self.input_batch.prev_sampled_token_ids = recv
+ 
+         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9e60d2ae7f..4dc472c60a 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
++import os
+ from collections import defaultdict
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+@@ -427,9 +428,21 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) ->
+     Calculate the amount of memory required by vLLM, then validate
+     that the current amount of free memory is sufficient for that.
+     """
+-    requested_memory = math.ceil(
+-        init_snapshot.total_memory * cache_config.gpu_memory_utilization
+-    )
++    util = cache_config.gpu_memory_utilization
++    # i+d: an integrated GPU shares host DDR with the CPU (and, under
++    # pipeline parallelism, with the discrete GPU's worker). Let it use a
++    # separate, smaller utilization via VLLM_XPU_IGPU_PP_MEM_UTIL so it does
++    # not over-reserve host memory. total_memory for an iGPU is the whole
++    # host DDR, so a single global util would starve the OS / other worker.
++    igpu_util = os.getenv("VLLM_XPU_IGPU_PP_MEM_UTIL")
++    if igpu_util:
++        try:
++            if current_platform.is_integrated_gpu(init_snapshot.device_.index):
++                util = float(igpu_util)
++        except Exception:
++            pass
++
++    requested_memory = math.ceil(init_snapshot.total_memory * util)
+ 
+     if init_snapshot.free_memory < requested_memory:
+         raise ValueError(
+@@ -437,7 +450,7 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) ->
+             f"({format_gib(init_snapshot.free_memory)}/"
+             f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
+             f"is less than desired GPU memory utilization "
+-            f"({cache_config.gpu_memory_utilization}, "
++            f"({util}, "
+             f"{format_gib(requested_memory)} GiB). Decrease GPU memory "
+             f"utilization or reduce GPU memory used by other processes."
+         )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 9c20df0d18..d41c773faf 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -557,9 +557,13 @@ class Worker(WorkerBase):
+             format_gib(free_gpu_memory - unrequested_memory),
+         )
+         logger.debug(profile_result)
+-        logger.info_once(
+-            "Available KV cache memory: %s GiB",
++        logger.info(
++            "Available KV cache memory: %s GiB (device xpu:%s, integrated=%s). "
++            "integrated=True is the iGPU stage -> tune VLLM_XPU_IGPU_PP_MEM_UTIL; "
++            "integrated=False is the dGPU stage -> tune gpu_memory_utilization.",
+             format_gib(self.available_kv_cache_memory_bytes),
++            self.device.index,
++            current_platform.is_integrated_gpu(self.device.index),
+         )
+ 
+         if cudagraph_memory_estimate > 0:
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index d4970d91b2..b83bcc7aa6 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2155,6 +2155,19 @@ def get_kv_cache_configs(
+     min_num_blocks = min(
+         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+     )
++    if len(kv_cache_configs) > 1:
++        per_rank_blocks = [c.num_blocks for c in kv_cache_configs]
++        bottleneck_rank = per_rank_blocks.index(min_num_blocks)
++        logger.info(
++            "KV cache num_blocks per PP/TP rank (rank order): %s; all ranks "
++            "clamped to the smallest = %d (bottleneck rank=%d). To grow the "
++            "shared KV pool, raise the memory utilization of the bottleneck "
++            "rank's device (iGPU stage: VLLM_XPU_IGPU_PP_MEM_UTIL; dGPU "
++            "stage: gpu_memory_utilization).",
++            per_rank_blocks,
++            min_num_blocks,
++            bottleneck_rank,
++        )
+     for kv_cache_config in kv_cache_configs:
+         num_blocks_old = kv_cache_config.num_blocks
+         kv_cache_config.num_blocks = min_num_blocks
